@@ -17,6 +17,7 @@ pip install deepspeed
 | **ZeRO-2** | Medium | High | Balanced training, moderate memory savings |
 | **ZeRO-3** | High | Medium | Large models, significant memory savings |
 | **ZeRO-3 + Offload** | Highest | Lowest | Very large models, maximum memory efficiency |
+| **Pipeline Parallelism** | Depends on number of stages | Medium | Deep models that need intra-layer model parallelism |
 
 ### 3. Launch Training
 
@@ -45,6 +46,9 @@ deepspeed --num_gpus=8 train_deepspeed.py config/train_gpt2_deepspeed_zero2.py
 
 # ZeRO-3 with custom parameters
 deepspeed --num_gpus=8 train_deepspeed.py config/train_gpt2_deepspeed_zero3.py --batch_size=16
+
+# Pipeline parallel example (2 stages across 4 GPUs)
+deepspeed --num_gpus=4 train_deepspeed.py config/train_gpt2_pipeline.py
 ```
 
 ## Detailed Strategy Explanations
@@ -87,6 +91,18 @@ Training configs:
 - `config/train_gpt2_deepspeed_zero2.py`
 - `config/train_gpt2_deepspeed_zero3.py`
 - `config/train_gpt2_deepspeed_zero3_offload.py`
+- `config/train_gpt2_pipeline.py`
+
+`deepspeed_configs/pipeline_config.json` pairs with the pipeline config above. You can set
+`"stages": "auto"` to match the total GPU count or override it via the config file for explicit control.
+
+### Pipeline Parallelism
+
+- **What it does**: Splits the model into sequential stages so that different GPUs host different layers.
+- **Memory savings**: Similar to ZeRO-1, but each GPU only holds a subset of layers, letting you scale deeper models.
+- **Communication overhead**: Each micro-batch sends activations between stages. Use more micro-batches (gradient accumulation) to keep the pipeline full.
+- **Best for**: When the model is too deep for a single GPU even with ZeRO, or when you want to combine ZeRO (stage 1) with pipeline parallelism.
+- **How to enable**: Use `config/train_gpt2_pipeline.py` together with `deepspeed_configs/pipeline_config.json`. Adjust `pipeline_parallel_size` to your desired number of stages.
 
 ## Multi-Node Training
 

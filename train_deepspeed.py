@@ -21,8 +21,11 @@ import json
 
 import numpy as np
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
+import torch.distributed as dist
 
 try:
     import deepspeed
@@ -32,24 +35,25 @@ except ImportError:
     DEEPSPEED_AVAILABLE = False
     print("DeepSpeed not available, falling back to DDP mode")
 
-from model import GPTConfig, GPT
+from model import GPTConfig, GPT, Block, LayerNorm
 
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
 # I/O
-out_dir = 'out'
+out_dir = 'out/shakespeare_gpt2_test'
 eval_interval = 2000
 log_interval = 1
 eval_iters = 200
 eval_only = False # if True, script exits right after the first eval
 always_save_checkpoint = True # if True, always save a checkpoint after each eval
 init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
+resume_from_checkpoint = None # specific checkpoint file to resume from (e.g., 'ckpt_step_005000.pt'). If None, uses latest 'ckpt.pt'
 # wandb logging
 wandb_log = False # disabled by default
 wandb_project = 'owt'
 wandb_run_name = 'gpt2' # 'run' + str(time.time())
 # data
-dataset = 'openwebtext'
+dataset = 'shakespeare'
 gradient_accumulation_steps = 5 * 8 # used to simulate larger batch sizes
 batch_size = 12 # if gradient_accumulation_steps > 1, this is the micro-batch size
 block_size = 1024
@@ -61,32 +65,49 @@ dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
 bias = False # do we use bias inside LayerNorm and Linear layers?
 # adamw optimizer
 learning_rate = 6e-4 # max learning rate
-max_iters = 600000 # total number of training iterations
+max_iters = 1000 # total number of training iterations (reduced for testing)
 weight_decay = 1e-1
 beta1 = 0.9
 beta2 = 0.95
 grad_clip = 1.0 # clip gradients at this value, or disable if == 0.0
 # learning rate decay settings
 decay_lr = True # whether to decay the learning rate
-warmup_iters = 2000 # how many steps to warm up for
-lr_decay_iters = 600000 # should be ~= max_iters per Chinchilla
+warmup_iters = 100 # how many steps to warm up for (reduced for testing)
+lr_decay_iters = 1000 # should be ~= max_iters per Chinchilla (reduced for testing)
 min_lr = 6e-5 # minimum learning rate, should be ~= learning_rate/10 per Chinchilla
 # DDP settings
 backend = 'nccl' # 'nccl', 'gloo', etc.
 # DeepSpeed settings
 deepspeed_config = None  # path to deepspeed config file
 use_deepspeed = False  # will be auto-detected
+pipeline_parallel_size = 1  # number of pipeline stages, 1 disables pipeline mode
+pipeline_partition_method = 'uniform'  # how to split layers across pipeline stages
+pipeline_activation_checkpoint_interval = 0  # DeepSpeed pipeline activation checkpoint interval
 # system
 device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
 compile = True # use PyTorch 2.0 to compile the model to be faster
+disable_flash_attention = False # set to True to disable Flash Attention and use manual attention instead
 # -----------------------------------------------------------------------------
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 exec(open('configurator.py').read()) # overrides from command line or config file
 config = {k: globals()[k] for k in config_keys} # will be useful for logging
 
+# Disable Flash Attention if requested (before model initialization)
+if disable_flash_attention:
+    if hasattr(torch.nn.functional, 'scaled_dot_product_attention'):
+        # Temporarily remove the function so model won't detect it
+        original_sdpa = torch.nn.functional.scaled_dot_product_attention
+        delattr(torch.nn.functional, 'scaled_dot_product_attention')
+        print("⚠️  Flash Attention disabled - using manual attention implementation")
+
 # Detect DeepSpeed usage
 use_deepspeed = DEEPSPEED_AVAILABLE and deepspeed_config is not None
+ds_config = None
+pipeline_parallelism_enabled = False
+if use_deepspeed:
+    with open(deepspeed_config, 'r') as f:
+        ds_config = json.load(f)
 
 # -----------------------------------------------------------------------------
 
@@ -145,15 +166,59 @@ elif use_deepspeed:
     
     # DeepSpeed handles gradient accumulation automatically
     # but we need to read the config to understand what it's doing
-    with open(deepspeed_config, 'r') as f:
-        ds_config = json.load(f)
-    
     # DeepSpeed will calculate these automatically if set to "auto"
     if isinstance(ds_config.get('gradient_accumulation_steps'), str) and ds_config['gradient_accumulation_steps'] == "auto":
         # Keep our current value for DeepSpeed to use
         pass
     else:
         gradient_accumulation_steps = ds_config.get('gradient_accumulation_steps', gradient_accumulation_steps)
+
+    pipeline_cfg = ds_config.get('pipeline') if ds_config else None
+    pipeline_parallelism_enabled = (pipeline_parallel_size > 1) or (pipeline_cfg is not None)
+    if pipeline_parallelism_enabled:
+        stages_value = pipeline_parallel_size
+        cfg_stages = pipeline_cfg.get('stages') if pipeline_cfg else None
+        if isinstance(cfg_stages, (int, float)):
+            stages_value = int(cfg_stages)
+        elif isinstance(cfg_stages, str):
+            if cfg_stages == 'auto':
+                stages_value = pipeline_parallel_size if pipeline_parallel_size > 1 else ddp_world_size
+            else:
+                stages_value = int(cfg_stages)
+        elif cfg_stages is not None:
+            stages_value = int(cfg_stages)
+        if stages_value <= 1:
+            stages_value = pipeline_parallel_size
+        pipeline_parallel_size = int(stages_value)
+        if pipeline_parallel_size < 1:
+            raise ValueError("pipeline_parallel_size must be >= 1")
+        if ddp_world_size % pipeline_parallel_size != 0:
+            raise ValueError(
+                f"World size {ddp_world_size} must be divisible by pipeline_parallel_size {pipeline_parallel_size}"
+            )
+
+        partition_value = pipeline_partition_method
+        if pipeline_cfg is not None and 'partition' in pipeline_cfg:
+            partition_value = pipeline_cfg['partition']
+        pipeline_partition_method = partition_value
+
+        checkpoint_value = pipeline_activation_checkpoint_interval
+        if pipeline_cfg is not None and 'activation_checkpoint_interval' in pipeline_cfg:
+            checkpoint_value = pipeline_cfg['activation_checkpoint_interval']
+        if isinstance(checkpoint_value, str) and checkpoint_value == 'auto':
+            checkpoint_value = 0
+        pipeline_activation_checkpoint_interval = int(checkpoint_value)
+
+        ds_pipeline = ds_config.setdefault('pipeline', {})
+        ds_pipeline['stages'] = pipeline_parallel_size
+        ds_pipeline['partition'] = pipeline_partition_method
+        ds_pipeline['activation_checkpoint_interval'] = pipeline_activation_checkpoint_interval
+        data_parallel_world_size = ddp_world_size // pipeline_parallel_size
+    else:
+        pipeline_parallelism_enabled = False
+
+    if pipeline_parallelism_enabled and not dist.is_initialized():
+        deepspeed.init_distributed(dist_backend=backend)
 else:
     # if not ddp, we are running on a single gpu, and one process
     master_process = True
@@ -162,10 +227,13 @@ else:
     ddp_local_rank = 0  # Add this for non-DDP case
     ddp_rank = 0
 
+if not (use_deepspeed and pipeline_parallelism_enabled):
+    data_parallel_world_size = ddp_world_size
+
 # Calculate tokens per iteration
 if use_deepspeed:
     # DeepSpeed handles the calculation, but we approximate for logging
-    tokens_per_iter = gradient_accumulation_steps * ddp_world_size * batch_size * block_size
+    tokens_per_iter = gradient_accumulation_steps * data_parallel_world_size * batch_size * block_size
 else:
     tokens_per_iter = gradient_accumulation_steps * ddp_world_size * batch_size * block_size
 
@@ -183,6 +251,10 @@ ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=
 
 # poor man's data loader
 data_dir = os.path.join('data', dataset)
+# Limit dataset to 1% for faster testing
+dataset_fraction = 1  # Use only 1% of the dataset
+if master_process:
+    print(f"⚠️  Using only {dataset_fraction*100}% of the dataset for testing")
 def get_batch(split):
     # We recreate np.memmap every batch to avoid a memory leak, as per
     # https://stackoverflow.com/questions/45132940/numpy-memmap-memory-usage-want-to-iterate-once/61472122#61472122
@@ -190,7 +262,16 @@ def get_batch(split):
         data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
     else:
         data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
-    ix = torch.randint(len(data) - block_size, (batch_size,))
+    # Limit to first dataset_fraction of the data
+    max_idx = int(len(data) * dataset_fraction)
+    # Ensure we have at least block_size + 1 elements to sample from
+    if max_idx <= block_size:
+        max_idx = min(block_size + 1, len(data))
+    # Ensure max_idx doesn't exceed actual data length
+    max_idx = min(max_idx, len(data))
+    # Calculate the maximum starting index (must be at least 1)
+    max_start_idx = max(1, max_idx - block_size)
+    ix = torch.randint(0, max_start_idx, (batch_size,))
     x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
     y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
     if device_type == 'cuda':
@@ -199,6 +280,94 @@ def get_batch(split):
     else:
         x, y = x.to(device), y.to(device)
     return x, y
+
+
+class PipelineEmbeddingStage(nn.Module):
+    """First pipeline stage: token + position embeddings."""
+
+    def __init__(self, config):
+        super().__init__()
+        self.block_size = config.block_size
+        self.wte = nn.Embedding(config.vocab_size, config.n_embd)
+        self.wpe = nn.Embedding(config.block_size, config.n_embd)
+        self.dropout = nn.Dropout(config.dropout)
+
+    def forward(self, inputs):
+        tokens, targets = inputs
+        B, T = tokens.size()
+        if T > self.block_size:
+            raise ValueError(f"Cannot forward sequence of length {T}, block size is only {self.block_size}")
+        pos = torch.arange(0, T, dtype=torch.long, device=tokens.device)
+        x = self.wte(tokens) + self.wpe(pos)
+        x = self.dropout(x)
+        return x, targets
+
+
+class PipelineBlockStage(nn.Module):
+    """Intermediate pipeline stage that applies a single Transformer block."""
+
+    def __init__(self, config):
+        super().__init__()
+        self.block = Block(config)
+
+    def forward(self, inputs):
+        x, targets = inputs
+        x = self.block(x)
+        return x, targets
+
+
+class PipelineFinalStage(nn.Module):
+    """Final pipeline stage that applies LN+LM head and returns logits."""
+
+    def __init__(self, config):
+        super().__init__()
+        self.ln_f = LayerNorm(config.n_embd, bias=config.bias)
+        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+
+    def forward(self, inputs):
+        x, targets = inputs
+        x = self.ln_f(x)
+        logits = self.lm_head(x)
+        return logits, targets
+
+
+class GPTPipelineLoss(nn.Module):
+    """Cross-entropy loss helper that accepts various output formats."""
+
+    def forward(self, outputs, labels=None):
+        if isinstance(outputs, tuple) and len(outputs) == 2 and labels is None:
+            logits, targets = outputs
+        elif labels is not None:
+            logits, targets = outputs, labels
+        else:
+            raise ValueError("Pipeline loss requires logits and targets")
+
+        return F.cross_entropy(
+            logits.view(-1, logits.size(-1)),
+            targets.view(-1),
+            ignore_index=-1,
+        )
+
+
+class RepeatingBatchIterator:
+    """Simple infinite iterator that repeatedly draws batches from get_batch."""
+
+    def __init__(self, split):
+        self.split = split
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        return get_batch(self.split)
+
+
+def build_pipeline_layers(config):
+    layers = [PipelineEmbeddingStage(config)]
+    for _ in range(config.n_layer):
+        layers.append(PipelineBlockStage(config))
+    layers.append(PipelineFinalStage(config))
+    return layers
 
 # init these up here, can override if init_from='resume' (i.e. from a checkpoint)
 iter_num = 0
@@ -216,66 +385,100 @@ if os.path.exists(meta_path):
 # model init
 model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
                   bias=bias, vocab_size=None, dropout=dropout) # start with model_args from command line
-if init_from == 'scratch':
-    # init a new model from scratch
-    print("Initializing a new model from scratch")
-    # determine the vocab size we'll use for from-scratch training
+gptconf = None
+model = None
+if use_deepspeed and pipeline_parallelism_enabled:
+    if init_from != 'scratch':
+        raise NotImplementedError("Pipeline parallelism currently supports init_from='scratch' only")
+    print("Initializing a new pipeline-parallel model from scratch")
     if meta_vocab_size is None:
         print("defaulting to vocab_size of GPT-2 to 50304 (50257 rounded up for efficiency)")
     model_args['vocab_size'] = meta_vocab_size if meta_vocab_size is not None else 50304
     gptconf = GPTConfig(**model_args)
-    model = GPT(gptconf)
-elif init_from == 'resume':
-    print(f"Resuming training from {out_dir}")
-    # resume training from a checkpoint.
-    ckpt_path = os.path.join(out_dir, 'ckpt.pt')
-    checkpoint = torch.load(ckpt_path, map_location=device)
-    checkpoint_model_args = checkpoint['model_args']
-    # force these config attributes to be equal otherwise we can't even resume training
-    # the rest of the attributes (e.g. dropout) can stay as desired from command line
-    for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
-        model_args[k] = checkpoint_model_args[k]
-    # create the model
+else:
+    if init_from == 'scratch':
+        # init a new model from scratch
+        print("Initializing a new model from scratch")
+        # determine the vocab size we'll use for from-scratch training
+        if meta_vocab_size is None:
+            print("defaulting to vocab_size of GPT-2 to 50304 (50257 rounded up for efficiency)")
+        model_args['vocab_size'] = meta_vocab_size if meta_vocab_size is not None else 50304
+        gptconf = GPTConfig(**model_args)
+        model = GPT(gptconf)
+    elif init_from == 'resume':
+        print(f"Resuming training from {out_dir}")
+        
+        # List available checkpoints for user reference
+        if os.path.exists(out_dir):
+            available_checkpoints = [f for f in os.listdir(out_dir) if f.endswith('.pt')]
+            if available_checkpoints:
+                print(f"Available checkpoints: {', '.join(sorted(available_checkpoints))}")
+        
+        # resume training from a checkpoint.
+        if resume_from_checkpoint is not None:
+            ckpt_filename = resume_from_checkpoint
+            ckpt_path = os.path.join(out_dir, ckpt_filename)
+            print(f"Resuming from specific checkpoint: {ckpt_filename}")
+        else:
+            ckpt_path = os.path.join(out_dir, 'ckpt.pt')
+            print("Resuming from latest checkpoint: ckpt.pt")
+        
+        if not os.path.exists(ckpt_path):
+            raise FileNotFoundError(f"Checkpoint file not found: {ckpt_path}")
+        
+        checkpoint = torch.load(ckpt_path, map_location=device)
+        checkpoint_model_args = checkpoint['model_args']
+        # force these config attributes to be equal otherwise we can't even resume training
+        # the rest of the attributes (e.g. dropout) can stay as desired from command line
+        for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
+            model_args[k] = checkpoint_model_args[k]
+        # create the model
+        gptconf = GPTConfig(**model_args)
+        model = GPT(gptconf)
+        state_dict = checkpoint['model']
+        # fix the keys of the state dictionary :(
+        # honestly no idea how checkpoints sometimes get this prefix, have to debug more
+        unwanted_prefix = '_orig_mod.'
+        for k,v in list(state_dict.items()):
+            if k.startswith(unwanted_prefix):
+                state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
+        model.load_state_dict(state_dict)
+        iter_num = checkpoint['iter_num']
+        best_val_loss = checkpoint['best_val_loss']
+    elif init_from.startswith('gpt2'):
+        print(f"Initializing from OpenAI GPT-2 weights: {init_from}")
+        # initialize from OpenAI GPT-2 weights
+        override_args = dict(dropout=dropout)
+        model = GPT.from_pretrained(init_from, override_args)
+        # read off the created config params, so we can store them into checkpoint correctly
+        for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
+            model_args[k] = getattr(model.config, k)
+        gptconf = model.config
+
+if gptconf is None:
     gptconf = GPTConfig(**model_args)
-    model = GPT(gptconf)
-    state_dict = checkpoint['model']
-    # fix the keys of the state dictionary :(
-    # honestly no idea how checkpoints sometimes get this prefix, have to debug more
-    unwanted_prefix = '_orig_mod.'
-    for k,v in list(state_dict.items()):
-        if k.startswith(unwanted_prefix):
-            state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
-    model.load_state_dict(state_dict)
-    iter_num = checkpoint['iter_num']
-    best_val_loss = checkpoint['best_val_loss']
-elif init_from.startswith('gpt2'):
-    print(f"Initializing from OpenAI GPT-2 weights: {init_from}")
-    # initialize from OpenAI GPT-2 weights
-    override_args = dict(dropout=dropout)
-    model = GPT.from_pretrained(init_from, override_args)
-    # read off the created config params, so we can store them into checkpoint correctly
-    for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
-        model_args[k] = getattr(model.config, k)
 
 # crop down the model block size if desired, using model surgery
-if block_size < model.config.block_size:
-    model.crop_block_size(block_size)
+if block_size < gptconf.block_size:
+    if model is not None:
+        model.crop_block_size(block_size)
+    else:
+        gptconf.block_size = block_size
     model_args['block_size'] = block_size # so that the checkpoint will have the right value
 
 # Initialize DeepSpeed or traditional setup
+pipeline_train_data_iter = None
+pipeline_eval_data_iters = {}
+
 if use_deepspeed:
     print(f"Initializing DeepSpeed with config: {deepspeed_config}")
-    
-    # Load DeepSpeed config
-    with open(deepspeed_config, 'r') as f:
-        ds_config = json.load(f)
     
     # Update DeepSpeed config with our parameters
     ds_config['train_micro_batch_size_per_gpu'] = batch_size
     ds_config['gradient_accumulation_steps'] = gradient_accumulation_steps
     
-    # Calculate and set train_batch_size
-    train_batch_size = batch_size * gradient_accumulation_steps * ddp_world_size
+    # Calculate and set train_batch_size (data parallel world size excludes pipeline stages)
+    train_batch_size = batch_size * gradient_accumulation_steps * data_parallel_world_size
     ds_config['train_batch_size'] = train_batch_size
     
     # Update optimizer parameters
@@ -294,16 +497,40 @@ if use_deepspeed:
     if 'gradient_clipping' in ds_config and ds_config['gradient_clipping'] == "auto":
         ds_config['gradient_clipping'] = grad_clip
     
+    if pipeline_parallelism_enabled:
+        from deepspeed.pipe import PipelineModule
+
+        pipeline_layers = build_pipeline_layers(gptconf)
+        pipeline_loss = GPTPipelineLoss()
+        ds_model = PipelineModule(
+            layers=pipeline_layers,
+            loss_fn=pipeline_loss,
+            num_stages=pipeline_parallel_size,
+            partition_method=pipeline_partition_method,
+            activation_checkpoint_interval=pipeline_activation_checkpoint_interval,
+        )
+        model_parameters = None
+    else:
+        ds_model = model
+        model_parameters = model.parameters()
+
     # Initialize DeepSpeed engine
     model_engine, optimizer, _, scheduler = deepspeed.initialize(
-        model=model,
+        model=ds_model,
         config=ds_config,
-        model_parameters=model.parameters()
+        model_parameters=model_parameters
     )
     
     model = model_engine
     # DeepSpeed handles compilation internally, so we disable it
     compile = False
+    
+    if pipeline_parallelism_enabled:
+        pipeline_train_data_iter = RepeatingBatchIterator('train')
+        pipeline_eval_data_iters = {
+            'train': RepeatingBatchIterator('train'),
+            'val': RepeatingBatchIterator('val'),
+        }
     
     print("DeepSpeed initialization complete")
     
@@ -383,20 +610,33 @@ checkpoint = None # free up memory
 def estimate_loss():
     out = {}
     model.eval()
-    for split in ['train', 'val']:
-        losses = torch.zeros(eval_iters)
-        for k in range(eval_iters):
-            X, Y = get_batch(split)
-            if use_deepspeed:
-                # DeepSpeed engine handles forward pass and autocast internally
-                outputs = model(X, Y)
-                loss = outputs[1] if isinstance(outputs, tuple) else outputs
-            else:
-                # Traditional training with manual autocast
-                with ctx:
-                    logits, loss = model(X, Y)
-            losses[k] = loss.item()
-        out[split] = losses.mean()
+    if use_deepspeed and pipeline_parallelism_enabled:
+        for split in ['train', 'val']:
+            losses = torch.zeros(eval_iters)
+            data_iter = pipeline_eval_data_iters[split]
+            for k in range(eval_iters):
+                batch = next(data_iter)
+                loss_val = model.eval_batch(batch)
+                if isinstance(loss_val, torch.Tensor):
+                    losses[k] = loss_val.item()
+                else:
+                    losses[k] = float(loss_val)
+            out[split] = losses.mean()
+    else:
+        for split in ['train', 'val']:
+            losses = torch.zeros(eval_iters)
+            for k in range(eval_iters):
+                X, Y = get_batch(split)
+                if use_deepspeed:
+                    # DeepSpeed engine handles forward pass and autocast internally
+                    outputs = model(X, Y)
+                    loss = outputs[1] if isinstance(outputs, tuple) else outputs
+                else:
+                    # Traditional training with manual autocast
+                    with ctx:
+                        logits, loss = model(X, Y)
+                losses[k] = loss.item()
+            out[split] = losses.mean()
     model.train()
     return out
 
@@ -420,7 +660,10 @@ if wandb_log and master_process:
     wandb.init(project=wandb_project, name=wandb_run_name, config=config)
 
 # training loop
-X, Y = get_batch('train') # fetch the very first batch
+if use_deepspeed and pipeline_parallelism_enabled:
+    X = Y = None
+else:
+    X, Y = get_batch('train') # fetch the very first batch
 t0 = time.time()
 training_start_time = time.time()  # Track overall training start time
 local_iter_num = 0 # number of iterations in the lifetime of this process
@@ -491,28 +734,49 @@ while True:
         if losses['val'] < best_val_loss or always_save_checkpoint:
             best_val_loss = losses['val']
             if iter_num > 0:
-                checkpoint = {
-                    'model': raw_model.state_dict(),
-                    'optimizer': optimizer.state_dict() if not use_deepspeed else None,
-                    'model_args': model_args,
-                    'iter_num': iter_num,
-                    'best_val_loss': best_val_loss,
-                    'config': config,
-                }
-                print(f"saving checkpoint to {out_dir}")
-                # Always use traditional PyTorch saving (faster than DeepSpeed's method)
-                torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
+                if use_deepspeed and pipeline_parallelism_enabled:
+                    ckpt_tag = f'step_{iter_num:06d}'
+                    save_path = os.path.join(out_dir, ckpt_tag)
+                    if master_process:
+                        print(f"saving DeepSpeed pipeline checkpoint to {save_path}")
+                    model.save_checkpoint(out_dir, tag=ckpt_tag)
+                else:
+                    checkpoint = {
+                        'model': raw_model.state_dict(),
+                        'optimizer': optimizer.state_dict() if not use_deepspeed else None,
+                        'model_args': model_args,
+                        'iter_num': iter_num,
+                        'best_val_loss': best_val_loss,
+                        'config': config,
+                    }
+                    
+                    # Save checkpoint with iteration step in filename
+                    ckpt_filename = f'ckpt_step_{iter_num:06d}.pt'
+                    ckpt_path = os.path.join(out_dir, ckpt_filename)
+                    print(f"saving checkpoint to {ckpt_path}")
+                    # Always use traditional PyTorch saving (faster than DeepSpeed's method)
+                    torch.save(checkpoint, ckpt_path)
+                    
+                    # Also save as latest checkpoint for easy resuming
+                    latest_ckpt_path = os.path.join(out_dir, 'ckpt.pt')
+                    torch.save(checkpoint, latest_ckpt_path)
+                    print(f"saved latest checkpoint as {latest_ckpt_path}")
     if iter_num == 0 and eval_only:
         break
 
     # forward backward update, with optional gradient accumulation to simulate larger batch size
     if use_deepspeed:
-        # DeepSpeed training step
-        loss = model(X, Y)[1] if isinstance(model(X, Y), tuple) else model(X, Y)
-        model.backward(loss)
-        model.step()
-        # immediately async prefetch next batch while model is doing the forward pass on the GPU
-        X, Y = get_batch('train')
+        if pipeline_parallelism_enabled:
+            batch = next(pipeline_train_data_iter)
+            loss = model.train_batch(batch)
+        else:
+            # DeepSpeed training step
+            outputs = model(X, Y)
+            loss = outputs[1] if isinstance(outputs, tuple) else outputs
+            model.backward(loss)
+            model.step()
+            # immediately async prefetch next batch while model is doing the forward pass on the GPU
+            X, Y = get_batch('train')
     else:
         # Traditional training loop with gradient accumulation
         for micro_step in range(gradient_accumulation_steps):
@@ -548,7 +812,7 @@ while True:
         # scale up to undo the division above, approximating the true total loss (exact would have been a sum)
         if use_deepspeed:
             # For DeepSpeed, loss is already scaled properly
-            lossf = loss.item()
+            lossf = loss.item() if isinstance(loss, torch.Tensor) else float(loss)
         else:
             lossf = loss.item() * gradient_accumulation_steps
         

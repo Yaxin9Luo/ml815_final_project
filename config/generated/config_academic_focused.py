@@ -45,3 +45,8 @@ weight_decay = 1e-1
 
 # Disable compile for DeepSpeed compatibility
 compile = False
+
+# --- Overrides for experiment: academic_focused ---
+out_dir = '/data/yaxin/pretrain_data_analysis/out/gpt2-medium-academic_focused'
+dataset = 'slimpajama-3b-academic_focused'
+wandb_run_name = 'academic_focused'

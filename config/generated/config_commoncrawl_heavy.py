@@ -45,3 +45,8 @@ weight_decay = 1e-1
 
 # Disable compile for DeepSpeed compatibility
 compile = False
+
+# --- Overrides for experiment: commoncrawl_heavy ---
+out_dir = '/data/yaxin/pretrain_data_analysis/out/gpt2-medium-commoncrawl_heavy'
+dataset = 'slimpajama-3b-commoncrawl_heavy'
+wandb_run_name = 'commoncrawl_heavy'

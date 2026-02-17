@@ -5,7 +5,8 @@
   "steps_per_print": 10,
   "pipeline": {
     "stages": "auto",
-    "partition": "uniform"
+    "partition": "uniform",
+    "activation_checkpoint_interval": 0
   },
   "zero_optimization": {
     "stage": 1,

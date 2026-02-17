@@ -45,3 +45,8 @@ weight_decay = 1e-1
 
 # Disable compile for DeepSpeed compatibility
 compile = False
+
+# --- Overrides for experiment: balanced_mix ---
+out_dir = '/data/yaxin/pretrain_data_analysis/out/gpt2-medium-balanced_mix'
+dataset = 'slimpajama-3b-balanced_mix'
+wandb_run_name = 'balanced_mix'

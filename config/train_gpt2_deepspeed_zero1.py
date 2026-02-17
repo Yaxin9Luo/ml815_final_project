@@ -4,7 +4,7 @@
 # launch: deepspeed --num_gpus=8 train_deepspeed.py config/train_gpt2_deepspeed_zero1.py
 
 wandb_log = True
-wandb_project = 'pretrain-data-analysis'
+wandb_project = 'parrella-gpt2'
 wandb_run_name = 'gpt2-124M-deepspeed-zero1'
 
 # DeepSpeed configuration
@@ -18,8 +18,8 @@ block_size = 1024
 gradient_accumulation_steps = 5 * 8
 
 # this makes total number of tokens be 300B
-max_iters = 600000
-lr_decay_iters = 600000
+max_iters = 1000
+lr_decay_iters = 1000
 
 # eval stuff
 eval_interval = 1000

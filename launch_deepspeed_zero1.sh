@@ -9,10 +9,10 @@ echo "Configuration: ZeRO Stage 1 (Optimizer state partitioning)"
 echo "Best for: Moderate memory savings with maximum speed"
 
 # Default to 8 GPUs, can be overridden with argument
-NUM_GPUS=${1:-8}
+NUM_GPUS=${1:-2}
 
 echo "Using $NUM_GPUS GPUs"
 
-deepspeed --num_gpus=$NUM_GPUS train_deepspeed.py config/train_gpt2_deepspeed_zero1.py
+deepspeed --num_gpus=$NUM_GPUS train_deepspeed.py config/train_gpt2_deepspeed_zero1.py --disable_flash_attention=True
 
 echo "Training completed!"
