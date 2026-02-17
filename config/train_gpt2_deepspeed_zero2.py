@@ -10,7 +10,7 @@
 
 wandb_log = True
 wandb_project = 'slimpajama-gpt2-experiments'
-wandb_run_name = 'gpt2-124m-balanced-12B'
+wandb_run_name = 'gpt2-124m-balanced-120B'
 
 # Dataset: SlimPajama balanced mixture
 dataset = 'slimpajama-3b-experiments/slimpajama-3b-balanced'
@@ -20,7 +20,7 @@ deepspeed_config = 'deepspeed_configs/zero2_config.json'
 use_deepspeed = True
 
 # Output directory
-out_dir = 'out/gpt2_124m_balanced_12B'
+out_dir = 'out/gpt2_124m_balanced_120B'
 
 # Batch settings targeting ~0.5M tokens per optimizer step
 # tokens_per_iter = batch_size * gradient_accumulation_steps * num_gpus * block_size
@@ -29,9 +29,9 @@ batch_size = 48  # micro-batch per GPU
 block_size = 1024
 gradient_accumulation_steps = 5  # per-GPU (DeepSpeed does NOT divide by world_size)
 
-# Training iterations for 12B tokens
-max_iters = 6105
-lr_decay_iters = 6105
+# Training iterations for 120B tokens
+max_iters = 61050
+lr_decay_iters = 61050
 
 # Learning rate schedule
 learning_rate = 6e-4
