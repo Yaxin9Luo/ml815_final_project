@@ -65,8 +65,9 @@ def tokenize_domain(domain, target_tokens, enc, raw_dir, output_dir):
     out_file = out_path / 'train.bin'
 
     # Get sorted chunk files for deterministic ordering
+    # Filenames are like chunk_842.jsonl.zst → need to extract number from "chunk_N"
     chunk_files = sorted(domain_path.glob('chunk_*.jsonl.zst'),
-                         key=lambda f: int(f.stem.split('_')[1]))
+                         key=lambda f: int(f.name.split('.')[0].split('_')[1]))
 
     if not chunk_files:
         logging.warning(f"No chunk files found for {domain} at {domain_path}")
